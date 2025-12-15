@@ -1,0 +1,90 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --staff-line-color: #000;
+  --staff-space-color: #fff;
+  --playhead-color: #3b82f6;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Score rendering area */
+.score-container {
+  background-color: var(--staff-space-color);
+  padding: 20px;
+  overflow-y: auto;
+  min-height: 400px;
+}
+
+/* VexFlow SVG container */
+.vexflow-svg {
+  width: 100%;
+  height: auto;
+}
+
+/* Playhead line */
+.playhead {
+  stroke: var(--playhead-color);
+  stroke-width: 2;
+  opacity: 0.8;
+}
+
+/* Feedback dots */
+.feedback-correct {
+  fill: var(--note-correct);
+  stroke: none;
+  r: 6;
+}
+
+.feedback-wrong {
+  fill: var(--note-wrong);
+  stroke: none;
+  r: 6;
+}
+
+.feedback-preview {
+  fill: var(--note-preview);
+  opacity: 0.35;
+}
+
+/* Feedback animation */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.8);
+  }
+
+  to {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+}
+
+.animate-fadeIn {
+  animation: fadeIn 0.3s ease-out;
+}
+
+/* Scroll animation for sight reading */
+@keyframes scrollLeft {
+  from {
+    transform: translateX(0);
+  }
+
+  to {
+    transform: translateX(-150px);
+  }
+}
+
+.staff-scroll {
+  animation: scrollLeft 0.5s ease-out;
+}
