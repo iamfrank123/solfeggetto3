@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import Header from '@/components/Layout/Header';
+import ScoreStats from '@/components/Feedback/ScoreStats';
 import StaticMelodicStaff from '@/components/Staff/StaticMelodicStaff';
 import generateMelodicPattern, { MelodicNote } from '@/lib/generator/melodic-generator';
 import { useRhythmAudio } from '@/hooks/useRhythmAudio';
@@ -23,7 +24,7 @@ interface GameNote {
 export default function MelodicSolfegePage() {
     const [bpm, setBpm] = useState(60);
     const [timeSignature, setTimeSignature] = useState<'3/4' | '4/4' | '6/8'>('4/4');
-    const [visualMode, setVisualMode] = useState<'scrolling' | 'static'>('static');
+    const visualMode = 'static'; // Force Static
     const [isMetronomeEnabled, setIsMetronomeEnabled] = useState(true);
 
     const { initAudio, startMetronome, stopMetronome, setBpm: updateAudioBpm, setTimeSignature: updateAudioSignature, getAudioTime } = useRhythmAudio();
@@ -37,7 +38,9 @@ export default function MelodicSolfegePage() {
     const [activeNotes, setActiveNotes] = useState<GameNote[]>([]);
     const [countdown, setCountdown] = useState<number | null>(null);
     const [bpmInput, setBpmInput] = useState(60);
+    const [stats, setStats] = useState({ perfect: 0, good: 0, miss: 0 });
     const [feedback, setFeedback] = useState<{ text: string; color: string } | null>(null);
+    const containerRef = useRef<HTMLDivElement>(null);
 
     const requestRef = useRef<number>();
     const nextSpawnTimeRef = useRef<number>(0);
@@ -90,11 +93,18 @@ export default function MelodicSolfegePage() {
             const absTimeDiff = Math.abs(timeDiff);
             const PERFECT_WINDOW_S = 0.10;
             const GOOD_WINDOW_S = 0.15;
+            const IGNORE_WINDOW_S = 0.4; // Notes further than this should be ignored (stray inputs)
+
+            // Fix: If input is too far from target (e.g. double trigger hitting next note), ignore it completely
+            if (absTimeDiff > IGNORE_WINDOW_S) {
+                return currentNotes;
+            }
 
             // Exact MIDI match required (no octave flexibility)
             if (played !== target.note.generated.midiNumber) {
                 setCombo(0);
-                setFeedback({ text: '❌ Wrong Note!', color: 'text-red-500' });
+                setStats(s => ({ ...s, miss: s.miss + 1 }));
+                setFeedback({ text: '❌ Nota Sbagliata!', color: 'text-red-500' });
                 setTimeout(() => setFeedback(null), 800);
                 return currentNotes.map(n => n.id === target.id ? { ...n, status: 'miss' as GameNote['status'] } : n);
             }
@@ -107,23 +117,26 @@ export default function MelodicSolfegePage() {
             if (absTimeDiff <= PERFECT_WINDOW_S) {
                 newStatus = 'match_perfect';
                 points = 5;
-                feedbackText = '✅ PERFECT!';
+                feedbackText = '✅ PERFETTO!';
                 feedbackColor = 'text-green-500';
+                setStats(s => ({ ...s, perfect: s.perfect + 1 }));
                 setCombo(c => c + 1);
             } else if (absTimeDiff <= GOOD_WINDOW_S) {
                 newStatus = 'match_good';
                 points = 3;
                 if (timeDiff > 0) {
-                    feedbackText = '⏱️ Early (Good)';
+                    feedbackText = '⏱️ Presto (Buono)';
                 } else {
-                    feedbackText = '⏱️ Late (Good)';
+                    feedbackText = '⏱️ Tardi (Buono)';
                 }
                 feedbackColor = 'text-yellow-500';
+                setStats(s => ({ ...s, good: s.good + 1 }));
                 setCombo(c => c + 1);
             } else {
                 newStatus = 'miss';
-                feedbackText = timeDiff > 0 ? '⚠️ Too Early!' : '⚠️ Too Late!';
+                feedbackText = timeDiff > 0 ? '⚠️ Troppo Presto!' : '⚠️ Troppo Tardi!';
                 feedbackColor = 'text-red-500';
+                setStats(s => ({ ...s, miss: s.miss + 1 }));
                 setCombo(0);
             }
 
@@ -165,7 +178,13 @@ export default function MelodicSolfegePage() {
         let audioStart = 0;
         if (isMetronomeEnabled) audioStart = startMetronome() || 0; else audioStart = getAudioTime() + 0.1;
 
-        setScore(0); setCombo(0); setActiveNotes([]); patternQueueRef.current = []; measuresSpawnedRef.current = 0;
+        setScore(0); setCombo(0); setStats({ perfect: 0, good: 0, miss: 0 }); setActiveNotes([]); patternQueueRef.current = []; measuresSpawnedRef.current = 0;
+        playPatternGeneratedRef.current = false;
+
+        // Auto-scroll to container
+        setTimeout(() => {
+            containerRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }, 100);
         playPatternGeneratedRef.current = false;
 
         const beatSec = 60 / bpm;
@@ -275,8 +294,15 @@ export default function MelodicSolfegePage() {
         }
 
         // Expire pending notes if too late
+        // Expire pending notes if too late
         setActiveNotes(prev => prev.map(n => {
-            if (n.status === 'pending' && currentTime > n.targetTime + 0.25) return { ...n, status: 'miss' as GameNote['status'] };
+            if (n.status === 'pending' && currentTime > n.targetTime + 0.25) {
+                // Fix: Green Rest Logic
+                if (n.note.isRest) {
+                    return { ...n, status: 'match_perfect' as const };
+                }
+                return { ...n, status: 'miss' as const };
+            }
             return n;
         }).filter(n => n.targetTime >= currentPageTimeRef.current - 5.0));
 
@@ -284,6 +310,24 @@ export default function MelodicSolfegePage() {
     };
 
     useEffect(() => { return () => { if (requestRef.current) cancelAnimationFrame(requestRef.current); }; }, []);
+
+    // Scoring effect for passive rests
+    const scoredNoteIds = useRef<Set<string>>(new Set());
+
+    useEffect(() => {
+        if (!isPlaying) return;
+        const unscoredGreenRests = activeNotes.filter(n =>
+            n.note.isRest && n.status === 'match_perfect' && !scoredNoteIds.current.has(n.id)
+        );
+        if (unscoredGreenRests.length > 0) {
+            unscoredGreenRests.forEach(n => scoredNoteIds.current.add(n.id));
+            setScore(s => s + (unscoredGreenRests.length * 5));
+            setStats(s => ({ ...s, perfect: s.perfect + unscoredGreenRests.length }));
+            setCombo(c => c + unscoredGreenRests.length);
+            setFeedback({ text: 'PAUSA OK! +5', color: 'text-green-500' });
+            setTimeout(() => setFeedback(null), 500);
+        }
+    }, [activeNotes, isPlaying]);
 
     // Expose a simple click handler (attempt) — prompts to use MIDI if pitch not available
     const handleInteraction = useCallback(() => {
@@ -297,78 +341,134 @@ export default function MelodicSolfegePage() {
             <main className="container mx-auto px-4 py-8 max-w-6xl">
                 <div className="text-center mb-8">
                     <h1 className="text-4xl font-bold text-amber-700">🎵 Melodic Solfege</h1>
-                    <p className="text-amber-600">Play the correct pitches, in the right octave, and in time.</p>
-                </div>
+                    <p className="text-amber-600 mb-4">Play the correct pitches, in the right octave, and in time.</p>
 
-                {/* Visible STOP Button (When Playing) */}
-                {isPlaying && (
-                    <div className="fixed top-20 right-4 z-[60] animate-in fade-in slide-in-from-top-4 duration-300">
-                        <button
-                            onClick={stopGame}
-                            onMouseDown={(e) => e.stopPropagation()}
-                            onTouchStart={(e) => e.stopPropagation()}
-                            className="bg-red-600 hover:bg-red-700 text-white font-bold py-3 px-8 rounded-full shadow-2xl border-4 border-white transform transition hover:scale-105 flex items-center gap-2"
-                        >
-                            <span className="text-2xl">⏹️</span>
-                            <span>STOP</span>
-                        </button>
-                    </div>
-                )}
-
-                <div className="grid grid-cols-3 gap-4 mb-6 text-center max-w-4xl mx-auto">
-                    <div className="bg-white p-4 rounded-lg shadow border border-amber-100">
-                        <p className="text-gray-500 text-sm">SCORE</p>
-                        <p className="text-3xl font-bold text-amber-600">{score}</p>
-                    </div>
-                    <div className="bg-white p-4 rounded-lg shadow border border-amber-100">
-                        <p className="text-gray-500 text-sm">COMBO</p>
-                        <p className="text-3xl font-bold text-orange-500">{combo}x</p>
-                    </div>
-                    <div className="bg-white p-4 rounded-lg shadow border border-amber-100">
-                        <p className="text-gray-500 text-sm">BPM</p>
-                        <div className="flex items-center justify-center space-x-2">
-                            <input type="range" min={40} max={200} value={bpm} onChange={(e) => { setBpm(Number(e.target.value)); }} disabled={isPlaying} className="w-24 accent-amber-600" />
-                            <span className="text-2xl font-bold text-stone-700">{bpm}</span>
+                    <div className="bg-yellow-50 border-l-4 border-yellow-400 p-4 max-w-2xl mx-auto text-left flex items-start">
+                        <span className="text-2xl mr-3">⚠️</span>
+                        <div>
+                            <p className="font-bold text-yellow-800">Tastiera MIDI Richiesta</p>
+                            <p className="text-yellow-700 text-sm">
+                                Questa modalità funziona solo collegando una tastiera MIDI.
+                                Se non hai un cavo MIDI, prova la <a href="/" className="underline font-bold hover:text-yellow-900">Rhythm Mode</a> per esercitarti con il ritmo (tocco/click).
+                            </p>
                         </div>
                     </div>
                 </div>
 
-                <div className="col-span-3 bg-white p-4 rounded-lg shadow border border-amber-100 mt-2 flex justify-center items-center space-x-4 max-w-4xl mx-auto">
-                    <span className="text-gray-500 text-sm font-bold">TIME SIG:</span>
-                    {(['3/4', '4/4', '6/8'] as const).map(sig => (
-                        <button
-                            key={sig}
-                            onClick={(e) => { e.stopPropagation(); setTimeSignature(sig); }}
-                            className={`px-3 py-1 rounded-full text-sm font-bold transition ${timeSignature === sig
-                                ? 'bg-amber-600 text-white shadow-md'
-                                : 'bg-gray-100 text-gray-500 hover:bg-gray-200'
-                                }`}
-                        >
-                            {sig}
-                        </button>
-                    ))}
-                </div>
 
-                <div className="flex justify-center mb-4">
-                    <div className="bg-stone-100 p-0.5 rounded-lg flex space-x-1">
-                        <button onClick={() => setVisualMode('scrolling')} className={`px-3 py-1 rounded-md text-sm font-bold ${visualMode === 'scrolling' ? 'bg-white shadow text-amber-600' : 'text-gray-400'}`}>🌊 Scrolling</button>
-                        <button onClick={() => setVisualMode('static')} className={`px-3 py-1 rounded-md text-sm font-bold ${visualMode === 'static' ? 'bg-white shadow text-amber-600' : 'text-gray-400'}`}>📄 Static</button>
+
+                {/* CONTROL PANEL (Above Staff) */}
+                <div className="bg-white p-4 rounded-xl shadow-md border border-amber-100 mb-6 relative z-20">
+
+                    {/* TOP ROW: Start/Stop + BPM */}
+                    <div className="flex flex-wrap justify-between items-center gap-4 mb-4 border-b border-gray-100 pb-4">
+                        <div>
+                            {!isPlaying ? (
+                                <button onClick={startGame} className="bg-amber-600 hover:bg-amber-700 text-white font-bold py-3 px-8 rounded-full shadow-lg transform transition hover:scale-105 flex items-center gap-2">
+                                    <span className="text-xl">▶️</span><span>START</span>
+                                </button>
+                            ) : (
+                                <button onClick={stopGame} className="bg-red-600 hover:bg-red-700 text-white font-bold py-3 px-8 rounded-full shadow-lg transform transition hover:scale-105 flex items-center gap-2">
+                                    <span className="text-xl">⏹️</span><span>STOP</span>
+                                </button>
+                            )}
+                        </div>
+
+                        <div className="flex items-center space-x-3 bg-stone-50 px-4 py-2 rounded-lg border border-stone-200">
+                            <span className="text-xs font-bold text-gray-500 uppercase">BPM</span>
+                            <input type="range" min="40" max="200" value={bpm} onChange={(e) => { e.stopPropagation(); setBpm(Number(e.target.value)); }} className="w-32 accent-amber-600" />
+                            <span className="text-xl font-bold text-amber-700 min-w-[3ch]">{bpm}</span>
+                        </div>
+                    </div>
+
+                    {/* MIDDLE ROW: Durations + Time Sig */}
+                    <div className="flex flex-wrap items-center justify-between gap-4 mb-4">
+                        <div className="flex items-center gap-2">
+                            <span className="text-xs font-bold text-gray-500 uppercase mr-2">Note:</span>
+                            <div className="flex flex-wrap gap-2">
+                                {/* Duration Checkboxes */}
+                                {([
+                                    { id: 'w', label: 'Semibreve' },
+                                    { id: 'h', label: 'Minima' },
+                                    { id: 'q', label: 'Semiminima' },
+                                    { id: '8', label: 'Croma' },
+                                    { id: '16', label: 'Semicroma' }
+                                ] as const).map((opt) => (
+                                    <label key={opt.id} className={`flex items-center space-x-1 cursor-pointer px-3 py-1.5 rounded-full border transition-all ${allowedDurations.includes(opt.id) ? 'bg-amber-50 border-amber-200 text-amber-800' : 'bg-white border-gray-200 text-gray-400 hover:border-gray-300'}`}>
+                                        <input
+                                            type="checkbox"
+                                            checked={allowedDurations.includes(opt.id)}
+                                            onChange={(e) => {
+                                                e.stopPropagation();
+                                                if (e.target.checked) setAllowedDurations([...allowedDurations, opt.id]);
+                                                else setAllowedDurations(allowedDurations.filter(d => d !== opt.id));
+                                            }}
+                                            className="w-4 h-4 text-amber-600 rounded focus:ring-amber-500 accent-amber-600"
+                                        />
+                                        <span className="text-sm font-medium">{opt.label}</span>
+                                    </label>
+                                ))}
+                            </div>
+                        </div>
+
+                        <div className="flex items-center gap-2 bg-stone-50 px-3 py-1.5 rounded-lg border border-stone-200">
+                            <span className="text-xs font-bold text-gray-500 uppercase">Tempo:</span>
+                            {(['3/4', '4/4'] as const).map(sig => (
+                                <button key={sig} onClick={(e) => { e.stopPropagation(); setTimeSignature(sig); }} className={`px-2 py-0.5 rounded text-sm font-bold transition ${timeSignature === sig ? 'bg-amber-600 text-white shadow-sm' : 'text-gray-400 hover:text-gray-600'}`}>{sig}</button>
+                            ))}
+                        </div>
+                    </div>
+
+                    {/* BOTTOM ROW: Settings (Rests, Metronome, Range) */}
+                    <div className="flex flex-wrap items-center justify-center sm:justify-start gap-6 pt-2 border-t border-gray-50">
+                        <label className="flex items-center space-x-2 cursor-pointer group">
+                            <input type="checkbox" checked={includeRests} onChange={e => setIncludeRests(e.target.checked)} className="w-5 h-5 text-amber-600 rounded focus:ring-amber-500" />
+                            <span className="text-gray-700 font-medium group-hover:text-amber-700 transition">Aggiungi Pause</span>
+                        </label>
+                        <label className="flex items-center space-x-2 cursor-pointer group">
+                            <input type="checkbox" checked={isMetronomeEnabled} onChange={e => setIsMetronomeEnabled(e.target.checked)} className="w-5 h-5 text-amber-600 rounded focus:ring-amber-500" />
+                            <span className="text-gray-700 font-medium group-hover:text-amber-700 transition">Metronomo</span>
+                        </label>
+                        <div className="flex items-center space-x-2 bg-stone-50 px-3 py-1 rounded-lg border border-stone-200">
+                            <span className="text-xs font-bold text-gray-500 uppercase">Intervallo:</span>
+                            <input value={minNote} onChange={e => setMinNote(e.target.value)} className="w-12 text-center border-b border-gray-300 focus:border-amber-500 outline-none bg-transparent" />
+                            <span className="text-gray-400">—</span>
+                            <input value={maxNote} onChange={e => setMaxNote(e.target.value)} className="w-12 text-center border-b border-gray-300 focus:border-amber-500 outline-none bg-transparent" />
+                        </div>
                     </div>
                 </div>
 
-                <div className="relative max-w-5xl mx-auto h-[420px] flex items-center justify-center" onMouseDown={handleInteraction} onTouchStart={handleInteraction}>
+                {/* Removed Visual Mode Toggle - Forced Static */}
+
+                <div
+                    ref={containerRef}
+                    className="relative max-w-5xl mx-auto h-[420px] flex items-center justify-center border-t border-gray-100 pt-4"
+                    onMouseDown={handleInteraction}
+                    onTouchStart={handleInteraction}
+                >
+                    {/* Internal Stats Overlay */}
+                    <div className="absolute top-2 left-0 right-0 flex justify-center space-x-4 pointer-events-none z-30">
+                        <ScoreStats perfect={stats.perfect} good={stats.good} miss={stats.miss} />
+                        {combo > 1 && (
+                            <div className="bg-white/90 px-4 py-2 rounded-lg border border-orange-200 shadow-sm">
+                                <span className="text-orange-500 font-bold block text-sm">COMBO</span>
+                                <span className="text-2xl font-bold text-orange-600">{combo}x</span>
+                            </div>
+                        )}
+                    </div>
+
                     {countdown !== null && (
-                        <div className="absolute -top-32 left-0 right-0 flex items-center justify-center z-40 pointer-events-none">
-                            <div className="text-center bg-white/90 px-8 py-4 rounded-2xl shadow-xl border border-amber-100">
-                                <div className="text-4xl font-black text-amber-600 mb-1">{countdown > 1 ? 'WAIT' : 'READY...'}</div>
-                                <div className="text-7xl font-black text-amber-800">{countdown}</div>
+                        <div className="absolute top-24 left-0 right-0 flex items-center justify-center z-40 pointer-events-none">
+                            <div className="text-center bg-white/90 px-6 py-2 rounded-xl shadow-lg border border-amber-100">
+                                <div className="text-xl font-bold text-amber-600 mb-0.5">{countdown > 1 ? 'WAIT' : 'READY...'}</div>
+                                <div className="text-4xl font-black text-amber-800">{countdown}</div>
                             </div>
                         </div>
                     )}
 
                     {feedback && (
-                        <div className="absolute -top-16 left-0 right-0 z-50 flex justify-center pointer-events-none">
-                            <div className={`text-3xl font-black animate-bounce ${feedback.color} bg-white/90 px-6 py-3 rounded-full shadow-lg`}>
+                        <div className="absolute top-32 left-0 right-0 z-50 flex justify-center pointer-events-none">
+                            <div className={`text-2xl font-black animate-bounce ${feedback.color} bg-white/95 px-6 py-2 rounded-full shadow-lg`}>
                                 {feedback.text}
                             </div>
                         </div>
@@ -377,68 +477,7 @@ export default function MelodicSolfegePage() {
                     <StaticMelodicStaff notes={activeNotes} timeSignature={timeSignature} />
                 </div>
 
-                {!isPlaying && (
-                    <div className="flex justify-center flex-col items-center space-y-4 pb-12">
-                        <div className="text-center space-y-4">
-                            <div className="flex space-x-6 justify-center bg-white p-4 rounded-lg shadow-sm flex-wrap">
-                                <label className="flex items-center space-x-2 cursor-pointer">
-                                    <input type="checkbox" checked={includeRests} onChange={e => setIncludeRests(e.target.checked)} className="w-5 h-5 text-amber-600" />
-                                    <span className="text-gray-700">Include Rests</span>
-                                </label>
 
-                                <label className="flex items-center space-x-2 cursor-pointer">
-                                    <input type="checkbox" checked={isMetronomeEnabled} onChange={e => setIsMetronomeEnabled(e.target.checked)} className="w-5 h-5 text-amber-600" />
-                                    <span className="text-gray-700">Metronome</span>
-                                </label>
-
-                                <div className="flex items-center space-x-2">
-                                    <label className="text-sm text-gray-600">Range</label>
-                                    <input value={minNote} onChange={e => setMinNote(e.target.value)} className="border px-2 py-1 rounded" />
-                                    <span className="text-gray-500">—</span>
-                                    <input value={maxNote} onChange={e => setMaxNote(e.target.value)} className="border px-2 py-1 rounded" />
-                                </div>
-
-                                <label className="flex items-center space-x-2 cursor-pointer">
-                                    <input type="checkbox" checked={customizeDurations} onChange={e => setCustomizeDurations(e.target.checked)} className="w-5 h-5 text-amber-600" />
-                                    <span className="text-gray-700">Custom Durations</span>
-                                </label>
-                            </div>
-
-                            {customizeDurations && (
-                                <div className="bg-white p-4 rounded-lg shadow-sm border border-amber-100">
-                                    <p className="text-sm text-gray-600 font-bold mb-3">Select Note Durations:</p>
-                                    <div className="flex flex-wrap gap-3 justify-center">
-                                        {(['w', 'h', 'q', '8', '16'] as const).map((dur) => (
-                                            <label key={dur} className="flex items-center space-x-2 cursor-pointer">
-                                                <input
-                                                    type="checkbox"
-                                                    checked={allowedDurations.includes(dur)}
-                                                    onChange={(e) => {
-                                                        if (e.target.checked) {
-                                                            setAllowedDurations([...allowedDurations, dur]);
-                                                        } else {
-                                                            setAllowedDurations(allowedDurations.filter(d => d !== dur));
-                                                        }
-                                                    }}
-                                                    className="w-4 h-4 text-amber-600"
-                                                />
-                                                <span className="text-sm text-gray-700">
-                                                    {dur === 'w' && 'Whole (4/4)'}
-                                                    {dur === 'h' && 'Half (2/4)'}
-                                                    {dur === 'q' && 'Quarter (1/4)'}
-                                                    {dur === '8' && 'Eighth (1/8)'}
-                                                    {dur === '16' && 'Sixteenth (1/16)'}
-                                                </span>
-                                            </label>
-                                        ))}
-                                    </div>
-                                </div>
-                            )}
-
-                            <button onClick={startGame} className="bg-amber-600 hover:bg-amber-700 text-white font-bold py-4 px-12 rounded-full shadow-lg">START MELODIC</button>
-                        </div>
-                    </div>
-                )}
             </main>
         </div>
     );

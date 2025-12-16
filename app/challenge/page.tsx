@@ -134,7 +134,7 @@ export default function ChallengePage() {
             // But requirements say "0 points if missing".
             // So we still look for something reasonably close.
             // Let's use a max interactive range of e.g. 150px to find a candidate to grade.
-            const MAX_INTERACTION_RANGE = 200;
+            const MAX_INTERACTION_RANGE = 300;
 
             let pendingNotes = currentNotes.filter(n =>
                 n.status === 'pending' &&
@@ -146,13 +146,23 @@ export default function ChallengePage() {
             // from both being validated with a single note input
             if (input.type === 'midi' && pendingNotes.length > 0) {
                 const inputPitch = input.pitch! % 12;
-                // Filter to only notes with matching pitch
-                const matchingNotes = pendingNotes.filter(n => (n.note.midiNumber % 12) === inputPitch);
+
+                // Fix: Only prioritize matching pitch if the note is ALREADY within a reasonable hit window.
+                // We don't want to skip a close note (that we missed the pitch of) just to grade a far-away future note 
+                // that happens to match the pitch we played.
+                // Use a tighter range for "Pitch Priority Selection" (e.g. 60px)
+                const PITCH_PRIORITY_RANGE = 60;
+
+                const matchingNotes = pendingNotes.filter(n =>
+                    (n.note.midiNumber % 12) === inputPitch &&
+                    Math.abs(n.x - HIT_X) <= PITCH_PRIORITY_RANGE
+                );
+
                 if (matchingNotes.length > 0) {
                     // Use only matching notes - this ensures only the first matching note is validated
                     pendingNotes = matchingNotes;
                 } else {
-                    // No matching pitch found - will show wrong note feedback
+                    // No matching pitch found in valid range - will fall back to closest note (likely showing wrong note feedback)
                 }
             }
 
@@ -160,11 +170,26 @@ export default function ChallengePage() {
 
             // Sort by distance to HIT_X to find the most "intentional" target
             // Typically the one closest to the line is the one being aimed at.
+            // Sort by distance to HIT_X to find the most "intentional" target
             pendingNotes.sort((a, b) => Math.abs(a.x - HIT_X) - Math.abs(b.x - HIT_X));
 
             const targetNote = pendingNotes[0];
 
             if (!targetNote) return currentNotes;
+
+            // Strict Interactive Zone: Only allow interaction if the note is reasonably close to the hit line.
+            // This prevents:
+            // 1. Grading "Future notes" (Red Future Notes).
+            // 2. Grading notes clearly too early as "Wrong Note" or "Miss".
+            // 3. User frustration when they play for a note that hasn't arrived yet.
+            const STRICT_INTERACTIVE_ZONE = 60; // Slightly larger than HIT_WINDOW_GOOD (35) + Buffer
+
+            const dist = Math.abs(targetNote.x - HIT_X);
+
+            // If closest note is too far, IGNORE INPUT COMPLETELY (neither correct nor wrong)
+            if (dist > STRICT_INTERACTIVE_ZONE) {
+                return currentNotes;
+            }
 
             // Usage validation
             if (input.type === 'midi') {
@@ -172,15 +197,19 @@ export default function ChallengePage() {
                 const isMatch = (input.pitch! % 12) === (targetNote.note.midiNumber % 12);
                 if (!isMatch) {
                     setCombo(0);
-                    setFeedback({ text: 'Wrong Note!', color: 'text-red-500' });
+                    setFeedback({ text: 'Nota Sbagliata!', color: 'text-red-500' });
                     setTimeout(() => setFeedback(null), 500);
+                    // Do NOT remove the note or mark as miss - just show feedback and let user try again 
+                    // (unless we want to punish? User asked "resolve feedback". Usually Wrong Note = Penalty but Note stays pending?)
+                    // Let's keep it clean: Wrong Note feedback only.
                     return currentNotes;
                 }
             }
             // For mouse, we assume they are trying to hit the current note regardless of pitch understanding (rhythm game style)
 
             // Grading
-            const dist = Math.abs(targetNote.x - HIT_X);
+            // dist is already calculated above
+
             let newStatus: GameNote['status'] = 'pending';
             let points = 0;
 
@@ -188,12 +217,12 @@ export default function ChallengePage() {
                 // Green Zone (+/- 30px)
                 newStatus = 'match_perfect';
                 points = SCORE_PERFECT;
-                setFeedback({ text: 'PERFECT! +5', color: 'text-green-500' });
+                setFeedback({ text: 'PERFETTO! +5', color: 'text-green-500' });
             } else if (dist <= HIT_WINDOW_GOOD) {
                 // Yellow Zone (+/- 35px)
                 newStatus = 'match_good';
                 points = SCORE_GOOD;
-                setFeedback({ text: 'Good +3', color: 'text-yellow-500' });
+                setFeedback({ text: 'Buono +3', color: 'text-yellow-500' });
             } else {
                 // Missed Zone (Red)
                 // If they clicked but were outside the valid window
@@ -204,7 +233,7 @@ export default function ChallengePage() {
                 // Or does missing a click mean you can try again?
                 // Usually rhythm games: bad timing = miss = note exhausted.
                 newStatus = 'miss';
-                setFeedback({ text: 'Miss! 0', color: 'text-red-500' });
+                setFeedback({ text: 'Mancato! 0', color: 'text-red-500' });
             }
 
             if (points > 0) {
@@ -246,7 +275,10 @@ export default function ChallengePage() {
                     <h1 className="text-4xl font-bold text-gray-800">
                         ⚡ Challenge Mode
                     </h1>
-                    <p className="text-gray-600">Tempo & Precision Training</p>
+                    <p className="text-gray-600 font-medium mt-2 max-w-2xl mx-auto">
+                        Tocca lo schermo o clicca quando la nota raggiunge il rettangolo a sinistra.
+                        È possibile anche esercitarsi connettendo lo strumento tramite Cavo MIDI.
+                    </p>
                 </div>
 
                 {/* Score Board */}

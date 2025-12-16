@@ -1,224 +1,693 @@
 'use client';
 
-import { useState, useCallback, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import Header from '@/components/Layout/Header';
-import Settings from '@/components/Settings/Settings';
-import ScrollingStaff from '@/components/Staff/ScrollingStaff';
-import FeedbackIndicator from '@/components/Feedback/FeedbackIndicator';
-import { KeySignature, NoteRange } from '@/lib/generator/types';
-import { NoteQueueManager } from '@/lib/generator/queue-manager';
-import { checkNoteMatch } from '@/lib/generator/note-generator';
-import { useMIDIInput } from '@/hooks/useMIDIInput';
-import { MIDINoteEvent } from '@/lib/types/midi';
+import ScoreStats from '@/components/Feedback/ScoreStats';
+import RhythmStaff from '@/components/Staff/RhythmStaff';
+import StaticRhythmStaff from '@/components/Staff/StaticRhythmStaff';
+import { generateRhythmPattern, RhythmNoteType } from '@/lib/generator/rhythm-generator';
+import { RhythmNote } from '@/lib/generator/rhythm-generator';
+import { useRhythmAudio } from '@/hooks/useRhythmAudio';
 
-export default function HomePage() {
-    // Settings state
-    const [keySignature, setKeySignature] = useState<KeySignature>('C');
-    const [noteRange, setNoteRange] = useState<NoteRange>({ low: 'C4', high: 'C5' });
+// Game Constants
+const SPAWN_X = 900;
+const HIT_X = 100;
+const HIT_WINDOW = 30; // +/- pixels for "perfect" (Green)
+const HIT_WINDOW_GOOD = 35; // +/- pixels for "good" (Yellow)
+const SCORE_PERFECT = 5;
+const SCORE_GOOD = 3;
+const SCORE_MISS = 0;
 
-    // Exercise state
-    const [isExerciseActive, setIsExerciseActive] = useState(false);
-    const [noteQueue, setNoteQueue] = useState<any[]>([]);
-    const [currentNoteIndex, setCurrentNoteIndex] = useState(0);
-    const [feedbackStatus, setFeedbackStatus] = useState<'idle' | 'correct' | 'incorrect'>('idle');
+interface RhythmGameNote {
+    id: string;
+    note: RhythmNote;
+    x: number;
+    status: 'pending' | 'hit' | 'miss' | 'match_perfect' | 'match_good';
+    targetTime: number; // Audio time when note hits bar
+}
 
-    // Queue manager ref
-    const queueManagerRef = useRef<NoteQueueManager | null>(null);
+export default function RhythmPage() {
+    // Settings
+    const [bpm, setBpm] = useState(60);
+    const [timeSignature, setTimeSignature] = useState<'3/4' | '4/4' | '6/8'>('4/4');
+    const [allowedFigures, setAllowedFigures] = useState<RhythmNoteType[]>(['w', 'h', 'q', '8']); // Default basic
+    const [includeRests, setIncludeRests] = useState(false);
 
-    // Progress tracking
-    const [notesPlayed, setNotesPlayed] = useState(0);
+    // VISUAL MODE - DEFAULT STATIC FOR HOME
+    const [visualMode, setVisualMode] = useState<'scrolling' | 'static'>('static');
 
-    // Lock for async operations
-    const isProcessingRef = useRef(false);
+    // Audio Settings
+    const [isMetronomeEnabled, setIsMetronomeEnabled] = useState(true);
+    const [isSoundEnabled, setIsSoundEnabled] = useState(true);
 
-    // Start exercise
-    const handleStartExercise = useCallback(() => {
-        // Create new queue manager with current settings
-        const manager = new NoteQueueManager(keySignature, noteRange);
-        manager.initializeQueue(20); // Generate 20 initial notes for preview
+    // Audio Hook
+    const { initAudio, startMetronome, stopMetronome, setBpm: updateAudioBpm, setTimeSignature: updateAudioSignature, playDrumSound, getAudioTime } = useRhythmAudio();
 
-        queueManagerRef.current = manager;
-        setNoteQueue(manager.getAllNotes());
-        setCurrentNoteIndex(0);
-        setIsExerciseActive(true);
-        setFeedbackStatus('idle');
-        setNotesPlayed(0);
-    }, [keySignature, noteRange]);
+    // Sync Audio BPM & Signature
+    useEffect(() => {
+        updateAudioBpm(bpm);
+    }, [bpm, updateAudioBpm]);
 
-    // Stop exercise
-    const handleStopExercise = useCallback(() => {
-        setIsExerciseActive(false);
-        setNoteQueue([]);
-        setCurrentNoteIndex(0);
-        setFeedbackStatus('idle');
-        queueManagerRef.current = null;
+    useEffect(() => {
+        const [num, den] = timeSignature.split('/').map(Number);
+        updateAudioSignature(num, den || 4);
+    }, [timeSignature, updateAudioSignature]);
+
+    // Game State
+    const [isPlaying, setIsPlaying] = useState(false);
+    const [score, setScore] = useState(0);
+    const [combo, setCombo] = useState(0);
+    const [activeNotes, setActiveNotes] = useState<RhythmGameNote[]>([]);
+    const [stats, setStats] = useState({ perfect: 0, good: 0, miss: 0 });
+    const [feedback, setFeedback] = useState<{ text: string; color: string } | null>(null);
+    const [countdown, setCountdown] = useState<number | null>(null);
+    const containerRef = useRef<HTMLDivElement>(null);
+
+    // Refs
+    // Timeline Refs
+    const requestRef = useRef<number>();
+    const nextSpawnTimeRef = useRef<number>(0);
+    const patternQueueRef = useRef<RhythmNote[]>([]);
+    const currentPageTimeRef = useRef<number>(0); // Start time of current Static Page (2 measures)
+    const firstNoteTimeRef = useRef<number>(0); // For Count-In calculation
+
+    // PROCESSED RESTS (For Auto-Success Logic)
+    const processedRestIdsRef = useRef<Set<string>>(new Set());
+
+    // LINEAR SPEED CONFIG
+    const measuresSpawnedRef = useRef<number>(0);
+
+    // LINEAR SPEED CONFIG
+    const pixelsPerSecond = bpm * 2;
+
+    // Duration Settings
+    const [durationOptions, setDurationOptions] = useState({
+        'w': true,  // Whole
+        'h': true,  // Half
+        'q': true,  // Quarter
+        '8': true,  // Eighth
+        '16': false // Sixteenth
+    });
+
+    // Update allowedFigures when checkboxes change
+    useEffect(() => {
+        const selected = Object.entries(durationOptions)
+            .filter(([_, isSelected]) => isSelected)
+            .map(([key]) => key as RhythmNoteType);
+
+        // Prevent empty selection (fallback to quarter)
+        if (selected.length === 0) setAllowedFigures(['q']);
+        else setAllowedFigures(selected);
+    }, [durationOptions]);
+
+    // Helper: Duration of 1 measure in Seconds
+    const getMeasureDuration = useCallback(() => {
+        const beatSec = 60 / bpm;
+        const [num] = timeSignature.split('/').map(Number);
+        return num * beatSec;
+    }, [bpm, timeSignature]);
+
+    // Start
+    const startGame = async (e?: React.MouseEvent) => {
+        e?.stopPropagation();
+
+        // 1. Request Fullscreen & Landscape
+        try {
+            if (!document.fullscreenElement) {
+                await document.documentElement.requestFullscreen();
+            }
+            // @ts-ignore - Screen Orientation API
+            if (screen.orientation && screen.orientation.lock) {
+                // @ts-ignore
+                await screen.orientation.lock('landscape').catch(err => console.log('Orientation lock failed:', err));
+            }
+        } catch (err) {
+            console.log('Fullscreen/Orientation failed:', err);
+        }
+
+        initAudio(); // Ensure context is ready
+        setIsPlaying(true);
+
+        let audioStart = 0;
+        if (isMetronomeEnabled) {
+            // @ts-ignore
+            audioStart = startMetronome() || 0;
+        } else {
+            audioStart = getAudioTime() + 0.1;
+        }
+
+        setScore(0);
+        setCombo(0);
+        setActiveNotes([]);
+        patternQueueRef.current = [];
+        measuresSpawnedRef.current = 0;
+        processedRestIdsRef.current = new Set(); // Reset processed rests
+
+        // Time Logic
+        const beatSec = 60 / bpm;
+        const [num] = timeSignature.split('/').map(Number);
+        const measureDur = num * beatSec;
+
+        // We want: [Gap (1m)] [Play (2m)]
+        // audioStart is NOW.
+        // We want the Gap to start NOW (or slightly after audioStart).
+        // And the first note to be at audioStart + measureDur.
+
+        const firstNoteTime = audioStart + measureDur;
+
+        nextSpawnTimeRef.current = firstNoteTime;
+        firstNoteTimeRef.current = firstNoteTime; // Used for "first ever" check if needed, but cycle logic supersedes.
+
+        // Static Page Start = Start of Gap
+        currentPageTimeRef.current = audioStart;
+
+        setStats({ perfect: 0, good: 0, miss: 0 });
+
+        // Auto-scroll to container
+        setTimeout(() => {
+            containerRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }, 100);
+
+        requestRef.current = requestAnimationFrame(gameLoop);
+    };
+
+    // Stop
+    const stopGame = async (e?: React.MouseEvent) => {
+        e?.stopPropagation();
+        setIsPlaying(false);
+        stopMetronome();
+        if (requestRef.current) cancelAnimationFrame(requestRef.current);
+
+        // Unlock orientation
+        // @ts-ignore
+        if (screen.orientation && screen.orientation.unlock) {
+            // @ts-ignore
+            screen.orientation.unlock();
+        }
+    };
+
+    // Toggle Metronome Runtime
+    useEffect(() => {
+        if (isPlaying) {
+            if (isMetronomeEnabled) startMetronome();
+            else stopMetronome();
+        }
+    }, [isMetronomeEnabled, isPlaying, startMetronome, stopMetronome]);
+
+    // Game Loop
+    const gameLoop = () => {
+        const currentTime = getAudioTime();
+        const measureDur = getMeasureDuration();
+
+        // CONFIG: STATIC MODE
+        const EXERCISE_MEASURES = 2; // User requested 2 continuous measures
+        const GAP_MEASURES = 1;      // User requested 4 beats break (1 measure in 4/4)
+
+        // 1. Countdown & Page Logic (Static Mode)
+        if (visualMode === 'static') {
+            const gapDur = measureDur * GAP_MEASURES;
+            const playDur = measureDur * EXERCISE_MEASURES;
+            const cycleDur = gapDur + playDur;
+
+            // Current Cycle Time
+            const timeInCycle = currentTime - currentPageTimeRef.current;
+
+            // 1a. Advance Cycle
+            if (timeInCycle >= cycleDur) {
+                currentPageTimeRef.current += cycleDur; // Flip Page
+            }
+
+            // 1b. Countdown (Visible during Gap)
+            if (timeInCycle < gapDur) {
+                // Precise Beat Calculation
+                const beatSec = 60 / bpm;
+                const currentBeatIndex = Math.floor(timeInCycle / beatSec);
+                const gapBeats = Math.round(gapDur / beatSec);
+                const beatsLeft = gapBeats - currentBeatIndex;
+
+                setCountdown(beatsLeft > 0 ? beatsLeft : null);
+            } else {
+                setCountdown(null);
+            }
+        }
+        else {
+            if (currentTime < firstNoteTimeRef.current) {
+                const beatSec = 60 / bpm;
+                const timeLeft = firstNoteTimeRef.current - currentTime;
+                const beatsLeft = Math.ceil(timeLeft / beatSec);
+                setCountdown(beatsLeft > 0 ? beatsLeft : null);
+            } else {
+                setCountdown(null);
+            }
+        }
+
+        // 2. Spawn Logic
+        // Fix: Preload needs to cover [Gap + Play Measures].
+        const PRELOAD_WINDOW = 20.0;
+
+        const notesToAdd: RhythmGameNote[] = [];
+
+        while (nextSpawnTimeRef.current < currentTime + PRELOAD_WINDOW) {
+            if (patternQueueRef.current.length === 0) {
+                patternQueueRef.current = generateRhythmPattern(allowedFigures, includeRests, timeSignature);
+                measuresSpawnedRef.current += 1;
+            }
+
+            const nextNote = patternQueueRef.current.shift();
+            if (nextNote) {
+                const beatSec = 60 / bpm;
+                const noteDur = (nextNote.duration === 'bar' ? 0 : nextNote.value) * beatSec;
+
+                const gameNote: RhythmGameNote = {
+                    id: Math.random().toString(36).substr(2, 9),
+                    note: nextNote,
+                    x: SPAWN_X,
+                    status: 'pending',
+                    targetTime: nextSpawnTimeRef.current
+                };
+
+                notesToAdd.push(gameNote); // Batch add
+                nextSpawnTimeRef.current += noteDur;
+
+                // Gap Insertion Logic
+                if (nextNote.duration === 'bar' && visualMode === 'static') {
+                    if (patternQueueRef.current.length === 0) {
+                        // Check if we completed the exercise block
+                        if (measuresSpawnedRef.current % EXERCISE_MEASURES === 0) {
+                            // Insert Gap
+                            nextSpawnTimeRef.current += (measureDur * GAP_MEASURES);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Status Update & cleanup
+        setActiveNotes(prev => {
+            // Combine previous with new batch
+            let nextState = [...prev, ...notesToAdd];
+
+            // Position update
+            if (visualMode === 'scrolling') {
+                nextState = nextState.map(n => {
+                    const diff = n.targetTime - currentTime;
+                    const newX = (diff * pixelsPerSecond) + HIT_X;
+                    return { ...n, x: newX };
+                });
+            } else {
+                // STATIC MODE: Position fixed by Staff component
+            }
+
+            // Expiration / Pruning / Rest Logic
+            return nextState.map(n => {
+                // If note has expired (passed time window)
+                if (n.status === 'pending' && currentTime > n.targetTime + 0.25) {
+                    // Check if it's a rest
+                    if (n.note.isRest) {
+                        return { ...n, status: 'match_perfect' as const };
+                    }
+
+                    // Otherwise regular miss
+                    return { ...n, status: 'miss' as const };
+                }
+                return n;
+            }).filter(n => {
+                // Pruning Logic
+                if (visualMode === 'static') {
+                    return n.targetTime >= currentPageTimeRef.current - 5.0;
+                } else {
+                    return n.targetTime > currentTime - 5.0;
+                }
+            });
+        });
+
+        requestRef.current = requestAnimationFrame(gameLoop);
+    };
+
+    useEffect(() => {
+        return () => {
+            if (requestRef.current) cancelAnimationFrame(requestRef.current);
+        };
     }, []);
 
-    // Handle MIDI input
-    const handleMIDINote = useCallback((event: MIDINoteEvent) => {
-        if (!isExerciseActive || !queueManagerRef.current || event.type !== 'noteOn') return;
+    // NEW EFFECT: Handle Rest Success Scoring
+    // Monitor activeNotes for any that just turned 'match_perfect' AND are Rests AND are not yet added to score? 
+    // Actually, the reducer above runs in the loop. The state updates immediately.
+    // The issue is counting the score.
+    // Let's implement a separate check in the loop or use a ref to track score updates? 
+    // Cleaner: Do it in the reducer? No, reducer shouldn't have side effects.
 
-        // Sync lock to prevent double-fire
-        if (isProcessingRef.current) return;
+    // Better approach: Separate interval or hook? 
+    // Simplest: Check in the loop function (gameLoop) right before setting state, OR
+    // use a useEffect on activeNotes changes (can be heavy).
 
-        // Prevent double triggering if we're already showing feedback/transitioning
-        if (feedbackStatus !== 'idle') return;
+    // Let's use a useEffect on activeNotes, but optimize.
+    useEffect(() => {
+        if (!isPlaying) return;
 
-        const manager = queueManagerRef.current;
-        const currentNote = manager.getCurrentNote();
+        setActiveNotes(notes => {
+            let scoreToAdd = 0;
+            let perfectToAdd = 0;
+            let feedbackToSet = null;
 
-        if (!currentNote) return;
+            const updatedNotes = notes.map(n => {
+                // Check if it is a rest that we just marked as perfect in the loop but haven't scored yet?
+                // The loop marked it 'match_perfect'. 
+                // We need a way to know if we 'scored' it. 
+                // Maybe add a property 'scored'? 
+                // Hack: 'match_perfect' is the status. If it's a rest, and status is match_perfect, we check a ref?
+                // Reuse 'processedRestIdsRef' from loop? That tracks "logic processing".
+                // We need a "score processing" tracker.
+                return n;
+            });
 
-        const isCorrect = checkNoteMatch(event.pitch, currentNote);
+            // Actually, simpler logic:
+            // In gameLoop, when we detect the rest passing:
+            // 1. Mark status 'match_perfect'.
+            // 2. Schedule score update (setScore, setStats) via a timeout or valid call.
+            // Since React state updates are batched, calling setScore from within the gameLoop (which runs via requestAnimationFrame) 
+            // might be slightly weird but is generally okay if careful. 
+            // BUT, `gameLoop` closes over state variables which are stale.
+            // So we shouldn't rely on `score+1`. We use function updates `setScore(s=>s+1)`.
 
-        if (isCorrect) {
-            // Lock immediately
-            isProcessingRef.current = true;
+            return notes;
+        });
+    }, [isPlaying]);
 
-            // Correct note! Show green feedback
-            setFeedbackStatus('correct');
-            setNotesPlayed(prev => prev + 1);
+    // REVISED GAMELOOP LOGIC FOR SCORE (Injecting Side Effects)
+    // We already do setStats inside checking logic. We should do the same for rests.
+    // But the rest check happens inside the `setActiveNotes` callback where we can't easily call other setters.
+    // SOLUTION: Use a `useEffect` that runs on every frame (via requestRef technically, or just rely on the component re-render loop if high frequency). 
+    // actually, let's just use a dedicated effect to scan for "green rests that haven't been scored".
 
-            // Add a small delay to allow for smooth transition before shifting
-            setTimeout(() => {
-                manager.shiftQueue();
-                setNoteQueue([...manager.getAllNotes()]);
-                // Index stays at 0 - we're always playing the first note
-                setFeedbackStatus('idle');
+    // We can add a specialized property to the note object or just use a Ref to track IDs scored.
+    const scoredNoteIds = useRef<Set<string>>(new Set());
 
-                // Unlock after transition completes
-                isProcessingRef.current = false;
-            }, 400); // Slightly longer delay for smoother visual
+    useEffect(() => {
+        if (!isPlaying) return;
 
-        } else {
-            // Incorrect note - show red feedback
-            setFeedbackStatus('incorrect');
+        const unscoredGreenRests = activeNotes.filter(n =>
+            n.note.isRest &&
+            n.status === 'match_perfect' &&
+            !scoredNoteIds.current.has(n.id)
+        );
 
-            // Clear feedback after a moment
-            setTimeout(() => {
-                setFeedbackStatus('idle');
-            }, 600);
+        if (unscoredGreenRests.length > 0) {
+            unscoredGreenRests.forEach(n => scoredNoteIds.current.add(n.id));
+
+            // Apply rewards
+            setScore(s => s + (unscoredGreenRests.length * SCORE_PERFECT));
+            setStats(s => ({ ...s, perfect: s.perfect + unscoredGreenRests.length }));
+            setCombo(c => c + unscoredGreenRests.length);
+            setFeedback({ text: 'GOOD REST! +5', color: 'text-green-500' });
+            setTimeout(() => setFeedback(null), 500);
         }
-    }, [isExerciseActive]);
 
-    const { isConnected, error: midiError } = useMIDIInput(handleMIDINote);
+    }, [activeNotes, isPlaying]);
+
+
+    // Interaction Handler
+    const handleInteraction = useCallback(() => {
+        if (!isPlaying) return;
+
+        const currentTime = getAudioTime();
+
+        setActiveNotes(currentNotes => {
+            // Algorithm: Find closest pending note to Current Time
+            // Filter candidates (Must be pending AND NOT A BAR LINE)
+            const candidates = currentNotes.filter(n => n.status === 'pending' && n.note.duration !== 'bar');
+            if (candidates.length === 0) return currentNotes;
+
+            // Sort by time difference
+            candidates.sort((a, b) => Math.abs(a.targetTime - currentTime) - Math.abs(b.targetTime - currentTime));
+            const target = candidates[0];
+
+            if (!target) return currentNotes;
+
+            // Time Difference in Seconds
+            const timeDiff = Math.abs(target.targetTime - currentTime);
+
+            // Define Windows in Seconds
+            const PERFECT_WINDOW_S = 0.10; // 50ms
+            const GOOD_WINDOW_S = 0.15;   // 100ms
+            // Miss window? If > 0.15s, maybe ignore click or count as miss?
+            // Existing logic enforced auto-miss only if passed.
+            // Here we treat click as attempt.
+
+            if (target.note.isRest) {
+                if (timeDiff < GOOD_WINDOW_S) {
+                    setCombo(0);
+                    setStats(s => ({ ...s, miss: s.miss + 1 }));
+                    setFeedback({ text: 'Don\'t Click Rests!', color: 'text-red-500' });
+                    setTimeout(() => setFeedback(null), 500);
+                    // Mark as miss
+                    return currentNotes.map(n => n.id === target.id ? { ...n, status: 'miss' } : n);
+                }
+                return currentNotes;
+            }
+
+            let newStatus: RhythmGameNote['status'] = 'pending';
+            let points = 0;
+
+            if (timeDiff <= PERFECT_WINDOW_S) {
+                newStatus = 'match_perfect';
+                points = SCORE_PERFECT;
+                setStats(s => ({ ...s, perfect: s.perfect + 1 }));
+                setFeedback({ text: 'PERFECT! +5', color: 'text-green-500' });
+                // Mark scored immediately
+                scoredNoteIds.current.add(target.id);
+            } else if (timeDiff <= GOOD_WINDOW_S) {
+                newStatus = 'match_good';
+                points = SCORE_GOOD;
+                setStats(s => ({ ...s, good: s.good + 1 }));
+                setFeedback({ text: 'Good +3', color: 'text-yellow-500' });
+                // Mark scored immediately
+                scoredNoteIds.current.add(target.id);
+            } else {
+                // Too early/late click?
+                // If very far, maybe ignore?
+                if (timeDiff > 0.2) return currentNotes; // Ignore accidental clicks far away
+
+                newStatus = 'miss';
+                setCombo(0);
+                setStats(s => ({ ...s, miss: s.miss + 1 }));
+                setFeedback({ text: 'Miss!', color: 'text-red-500' });
+            }
+
+            if (points > 0) {
+                if (isSoundEnabled) playDrumSound();
+                setScore(s => s + points);
+                setCombo(c => c + 1);
+            }
+            setTimeout(() => setFeedback(null), 500);
+
+            return currentNotes.map(n => n.id === target.id ? { ...n, status: newStatus } : n);
+        });
+    }, [isPlaying, isSoundEnabled, playDrumSound, getAudioTime]);
 
     return (
-        <div className="min-h-screen bg-gradient-to-br from-slate-50 via-blue-50 to-indigo-50">
+        <div className="min-h-screen bg-stone-50">
             <Header />
 
-            <main className="container mx-auto px-4 py-8 max-w-6xl">
-                {/* Title */}
+            <main
+                className="container mx-auto px-4 py-8 max-w-6xl cursor-pointer select-none"
+                onMouseDown={handleInteraction}
+                onTouchStart={handleInteraction}
+            >
                 <div className="text-center mb-8">
-                    <h1 className="text-4xl font-bold text-gray-800 mb-2">
-                        🎹 Pentagramma - Continuous Sight Reading
-                    </h1>
-                    <p className="text-lg text-gray-600">
-                        Esercizio continuo di lettura musicale a scorrimento
+                    <h1 className="text-4xl font-bold text-amber-700">🥁 Rhythm Mode</h1>
+                    {/* INSTRUCTIONS IN ITALIAN */}
+                    <p className="text-amber-600 font-medium mt-2 max-w-xl mx-auto">
+                        Tocca lo schermo o clicca con il mouse <strong>a tempo</strong> con le note.
+                        Durante le <strong>pause</strong>, non fare nulla e aspetta che passino (diventeranno verdi!).
                     </p>
                 </div>
 
-                {/* MIDI Status */}
-                <div className="mb-6">
-                    {isConnected ? (
-                        <div className="bg-green-50 border-2 border-green-200 rounded-lg p-4 text-center">
-                            <p className="text-green-700 font-semibold">
-                                ✅ Tastiera MIDI connessa - Pronto per l'esercizio!
-                            </p>
-                        </div>
-                    ) : (
-                        <div className="bg-yellow-50 border-2 border-yellow-200 rounded-lg p-4 text-center">
-                            <p className="text-yellow-700">
-                                ⚠️ Nessuna tastiera MIDI connessa
-                            </p>
-                            <p className="text-yellow-600 text-sm mt-1">
-                                Collega una tastiera MIDI per iniziare
-                            </p>
-                        </div>
-                    )}
 
-                    {midiError && (
-                        <div className="mt-4 bg-red-50 border-2 border-red-200 rounded-lg p-4">
-                            <p className="text-red-700">🚫 Errore MIDI: {midiError}</p>
+                {/* CONTROL PANEL (Above Staff) */}
+                <div className="bg-white p-4 rounded-xl shadow-md border border-amber-100 mb-6 relative z-20">
+
+                    {/* TOP ROW: Start/Stop + BPM + Visual Mode */}
+                    <div className="flex flex-wrap justify-between items-center gap-4 mb-4 border-b border-gray-100 pb-4">
+
+                        {/* Start/Stop Button */}
+                        <div>
+                            {!isPlaying ? (
+                                <button
+                                    onClick={startGame}
+                                    className="bg-amber-600 hover:bg-amber-700 text-white font-bold py-3 px-8 rounded-full shadow-lg transform transition hover:scale-105 flex items-center gap-2"
+                                >
+                                    <span className="text-xl">▶️</span>
+                                    <span>START</span>
+                                </button>
+                            ) : (
+                                <button
+                                    onClick={stopGame}
+                                    className="bg-red-600 hover:bg-red-700 text-white font-bold py-3 px-8 rounded-full shadow-lg transform transition hover:scale-105 flex items-center gap-2"
+                                >
+                                    <span className="text-xl">⏹️</span>
+                                    <span>STOP</span>
+                                </button>
+                            )}
                         </div>
-                    )}
+
+                        {/* Visual Mode Toggle */}
+                        <div className="bg-stone-100 p-1 rounded-lg flex space-x-1">
+                            <button
+                                onClick={(e) => { e.stopPropagation(); setVisualMode('scrolling'); }}
+                                className={`px-4 py-2 rounded-md font-bold transition flex items-center gap-2 ${visualMode === 'scrolling' ? 'bg-white shadow text-amber-600' : 'text-gray-400 hover:text-gray-600'}`}
+                            >
+                                <span className="text-xl">🌊</span>
+                                <span>Scrolling</span>
+                            </button>
+                            <button
+                                onClick={(e) => { e.stopPropagation(); setVisualMode('static'); }}
+                                className={`px-4 py-2 rounded-md font-bold transition flex items-center gap-2 ${visualMode === 'static' ? 'bg-white shadow text-amber-600' : 'text-gray-400 hover:text-gray-600'}`}
+                            >
+                                <span className="text-xl">📄</span>
+                                <span>Static</span>
+                            </button>
+                        </div>
+
+                        {/* BPM Slider */}
+                        <div className="flex items-center space-x-3 bg-stone-50 px-4 py-2 rounded-lg border border-stone-200">
+                            <span className="text-xs font-bold text-gray-500 uppercase">BPM</span>
+                            <input
+                                type="range"
+                                min="40"
+                                max="200"
+                                value={bpm}
+                                onChange={(e) => { e.stopPropagation(); setBpm(Number(e.target.value)); }}
+                                className="w-32 accent-amber-600"
+                            />
+                            <span className="text-xl font-bold text-amber-700 min-w-[3ch]">{bpm}</span>
+                        </div>
+                    </div>
+
+                    {/* MIDDLE ROW: Durations + Time Sig */}
+                    <div className="flex flex-wrap items-center justify-between gap-4 mb-4">
+
+                        {/* Durations (Always Visible) */}
+                        <div className="flex items-center gap-2">
+                            <span className="text-xs font-bold text-gray-500 uppercase mr-2">Note:</span>
+                            <div className="flex flex-wrap gap-2">
+                                {[
+                                    { id: 'w', label: 'Whole' },
+                                    { id: 'h', label: 'Half' },
+                                    { id: 'q', label: 'Quarter' },
+                                    { id: '8', label: '8th' },
+                                    { id: '16', label: '16th' }
+                                ].map(opt => (
+                                    <label key={opt.id} className={`flex items-center space-x-1 cursor-pointer px-3 py-1.5 rounded-full border transition-all ${durationOptions[opt.id as keyof typeof durationOptions] ? 'bg-amber-50 border-amber-200 text-amber-800' : 'bg-white border-gray-200 text-gray-400 hover:border-gray-300'}`}>
+                                        <input
+                                            type="checkbox"
+                                            checked={durationOptions[opt.id as keyof typeof durationOptions]}
+                                            onChange={(e) => {
+                                                e.stopPropagation();
+                                                setDurationOptions(prev => ({ ...prev, [opt.id]: e.target.checked }));
+                                            }}
+                                            className="w-4 h-4 text-amber-600 rounded focus:ring-amber-500 accent-amber-600"
+                                        />
+                                        <span className="text-sm font-medium">{opt.label}</span>
+                                    </label>
+                                ))}
+                            </div>
+                        </div>
+
+                        {/* Time Signature */}
+                        <div className="flex items-center gap-2 bg-stone-50 px-3 py-1.5 rounded-lg border border-stone-200">
+                            <span className="text-xs font-bold text-gray-500 uppercase">Time:</span>
+                            {(['3/4', '4/4', '6/8'] as const).map(sig => (
+                                <button
+                                    key={sig}
+                                    onClick={(e) => { e.stopPropagation(); setTimeSignature(sig); }}
+                                    className={`px-2 py-0.5 rounded text-sm font-bold transition ${timeSignature === sig
+                                        ? 'bg-amber-600 text-white shadow-sm'
+                                        : 'text-gray-400 hover:text-gray-600'
+                                        }`}
+                                >
+                                    {sig}
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+
+                    {/* BOTTOM ROW: Settings (Rests, Metronome, Sounds) */}
+                    <div className="flex flex-wrap items-center justify-center sm:justify-start gap-6 pt-2 border-t border-gray-50">
+                        <label className="flex items-center space-x-2 cursor-pointer group">
+                            <input type="checkbox" checked={includeRests} onChange={e => setIncludeRests(e.target.checked)} className="w-5 h-5 text-amber-600 rounded focus:ring-amber-500" />
+                            <span className="text-gray-700 font-medium group-hover:text-amber-700 transition">Include Rests</span>
+                        </label>
+
+                        <label className="flex items-center space-x-2 cursor-pointer group">
+                            <input type="checkbox" checked={isMetronomeEnabled} onChange={e => setIsMetronomeEnabled(e.target.checked)} className="w-5 h-5 text-amber-600 rounded focus:ring-amber-500" />
+                            <span className="text-gray-700 font-medium group-hover:text-amber-700 transition">Metronome</span>
+                        </label>
+
+                        <label className="flex items-center space-x-2 cursor-pointer group">
+                            <input type="checkbox" checked={isSoundEnabled} onChange={e => setIsSoundEnabled(e.target.checked)} className="w-5 h-5 text-amber-600 rounded focus:ring-amber-500" />
+                            <span className="text-gray-700 font-medium group-hover:text-amber-700 transition">Sounds</span>
+                        </label>
+                    </div>
+
                 </div>
 
-                {/* Settings */}
-                <Settings
-                    keySignature={keySignature}
-                    noteRange={noteRange}
-                    onKeySignatureChange={setKeySignature}
-                    onNoteRangeChange={setNoteRange}
-                    isExerciseActive={isExerciseActive}
-                    onStartExercise={handleStartExercise}
-                    onStopExercise={handleStopExercise}
-                />
+                {/* Game Area */}
+                <div
+                    ref={containerRef}
+                    className="relative max-w-5xl mx-auto h-[400px] flex items-center justify-center border-t border-gray-100 mt-8 pt-4"
+                >
 
-                {/* Scrolling Staff Display */}
-                <ScrollingStaff
-                    notes={noteQueue}
-                    currentNoteIndex={currentNoteIndex}
-                    keySignature={keySignature}
-                    feedbackStatus={feedbackStatus}
-                />
+                    {/* UI OVERLAYS (Positioned ABOVE staff) */}
 
-                {/* Instructions */}
-                {!isExerciseActive && (
-                    <div className="mt-8 bg-white rounded-xl shadow-lg p-6">
-                        <h3 className="text-xl font-bold text-gray-800 mb-4">
-                            📖 Come funziona il Sight Reading Continuo
-                        </h3>
-                        <ul className="space-y-3 text-gray-700">
-                            <li className="flex items-start">
-                                <span className="text-blue-600 mr-3 text-xl">1.</span>
-                                <span>
-                                    <strong>Configura:</strong> Scegli tonalità e range di note
-                                </span>
-                            </li>
-                            <li className="flex items-start">
-                                <span className="text-blue-600 mr-3 text-xl">2.</span>
-                                <span>
-                                    <strong>Premi START:</strong> Vedrai 8-10 note generate sul pentagramma
-                                </span>
-                            </li>
-                            <li className="flex items-start">
-                                <span className="text-blue-600 mr-3 text-xl">3.</span>
-                                <span>
-                                    <strong>Suona la PRIMA nota (BLU):</strong> La prima nota è sempre quella da suonare
-                                </span>
-                            </li>
-                            <li className="flex items-start">
-                                <span className="text-blue-600 mr-3 text-xl">4.</span>
-                                <span>
-                                    <strong>Procedi automaticamente:</strong> Note corrette diventano grigie, l'esercizio avanza, nuove note appaiono
-                                </span>
-                            </li>
-                            <li className="flex items-start">
-                                <span className="text-blue-600 mr-3 text-xl">5.</span>
-                                <span>
-                                    <strong>Esercizio infinito:</strong> L'esercizio continua finché non premi STOP
-                                </span>
-                            </li>
-                        </ul>
+                    {/* Internal Stats Overlay */}
+                    <div className="absolute top-2 left-0 right-0 flex justify-center space-x-4 pointer-events-none z-30">
+                        <ScoreStats perfect={stats.perfect} good={stats.good} miss={stats.miss} />
+                        {combo > 1 && (
+                            <div className="bg-white/90 px-4 py-2 rounded-lg border border-orange-200 shadow-sm">
+                                <span className="text-orange-500 font-bold block text-sm">COMBO</span>
+                                <span className="text-2xl font-bold text-orange-600">{combo}x</span>
+                            </div>
+                        )}
                     </div>
-                )}
 
-                {/* Exercise Stats (when active) */}
-                {isExerciseActive && (
-                    <div className="mt-6 bg-white rounded-xl shadow-lg p-6">
-                        <div className="text-center">
-                            <p className="text-gray-700">
-                                <span className="font-bold text-2xl text-blue-600">{notesPlayed}</span>
-                                <span className="text-gray-500 ml-2">note suonate correttamente</span>
-                            </p>
+                    {/* Countdown Overlay - Moved TOP */}
+                    {countdown !== null && (
+                        <div className="absolute top-24 left-0 right-0 flex items-center justify-center z-40 pointer-events-none transition-opacity duration-300">
+                            <div key={countdown} className="text-center animate-in zoom-in duration-75 bg-white/90 px-6 py-2 rounded-xl shadow-lg border border-amber-100">
+                                <div className="text-xl font-black text-amber-600 mb-0.5">
+                                    {countdown > 1 ? 'WAIT' : 'READY...'}
+                                </div>
+                                <div className="text-4xl font-black text-amber-800">
+                                    {countdown}
+                                </div>
+                            </div>
                         </div>
-                    </div>
-                )}
-            </main>
+                    )}
 
-            {/* Feedback Overlay */}
-            <FeedbackIndicator status={feedbackStatus} />
-        </div>
+                    {/* Feedback - Moved TOP */}
+                    {feedback && (
+                        <div className="absolute top-36 left-0 right-0 z-50 flex justify-center pointer-events-none">
+                            <div className={`text-2xl font-black animate-bounce ${feedback.color} bg-white/90 px-6 py-2 rounded-full shadow-lg`}>
+                                {feedback.text}
+                            </div>
+                        </div>
+                    )}
+
+
+
+                    {visualMode === 'scrolling' ? (
+                        <RhythmStaff notes={activeNotes} hitX={HIT_X} />
+                    ) : (
+                        <StaticRhythmStaff
+                            notes={activeNotes.filter(n => n.targetTime >= currentPageTimeRef.current && n.targetTime < currentPageTimeRef.current + (getMeasureDuration() * 3))}
+                            timeSignature={timeSignature}
+                            currentBeatIndex={0}
+                        />
+                    )}
+
+                </div>
+            </main >
+        </div >
     );
-}
+};

@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import Header from '@/components/Layout/Header';
+import ScoreStats from '@/components/Feedback/ScoreStats';
 import RhythmStaff from '@/components/Staff/RhythmStaff';
 import StaticRhythmStaff from '@/components/Staff/StaticRhythmStaff';
 import { generateRhythmPattern, RhythmNoteType } from '@/lib/generator/rhythm-generator';
@@ -57,8 +58,10 @@ export default function RhythmPage() {
     const [score, setScore] = useState(0);
     const [combo, setCombo] = useState(0);
     const [activeNotes, setActiveNotes] = useState<RhythmGameNote[]>([]);
+    const [stats, setStats] = useState({ perfect: 0, good: 0, miss: 0 });
     const [feedback, setFeedback] = useState<{ text: string; color: string } | null>(null);
     const [countdown, setCountdown] = useState<number | null>(null);
+    const containerRef = useRef<HTMLDivElement>(null);
 
     // Refs
     // Timeline Refs
@@ -67,6 +70,9 @@ export default function RhythmPage() {
     const patternQueueRef = useRef<RhythmNote[]>([]);
     const currentPageTimeRef = useRef<number>(0); // Start time of current Static Page (2 measures)
     const firstNoteTimeRef = useRef<number>(0); // For Count-In calculation
+
+    // PROCESSED RESTS (For Auto-Success Logic)
+    const processedRestIdsRef = useRef<Set<string>>(new Set());
 
     // LINEAR SPEED CONFIG
     const measuresSpawnedRef = useRef<number>(0);
@@ -135,6 +141,7 @@ export default function RhythmPage() {
         setActiveNotes([]);
         patternQueueRef.current = [];
         measuresSpawnedRef.current = 0;
+        processedRestIdsRef.current = new Set(); // Reset processed rests
 
         // Time Logic
         const beatSec = 60 / bpm;
@@ -153,6 +160,13 @@ export default function RhythmPage() {
 
         // Static Page Start = Start of Gap
         currentPageTimeRef.current = audioStart;
+
+        setStats({ perfect: 0, good: 0, miss: 0 });
+
+        // Auto-scroll to container
+        setTimeout(() => {
+            containerRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }, 100);
 
         requestRef.current = requestAnimationFrame(gameLoop);
     };
@@ -289,9 +303,13 @@ export default function RhythmPage() {
                 // STATIC MODE: Position fixed by Staff component
             }
 
-            // Expiration / Pruning
+            // Expiration / Pruning / Rest Logic
             return nextState.map(n => {
                 if (n.status === 'pending' && currentTime > n.targetTime + 0.25) {
+                    // Check if it's a rest
+                    if (n.note.isRest) {
+                        return { ...n, status: 'match_perfect' as const };
+                    }
                     return { ...n, status: 'miss' as const };
                 }
                 return n;
@@ -317,6 +335,30 @@ export default function RhythmPage() {
             if (requestRef.current) cancelAnimationFrame(requestRef.current);
         };
     }, []);
+
+    const scoredNoteIds = useRef<Set<string>>(new Set());
+
+    useEffect(() => {
+        if (!isPlaying) return;
+
+        const unscoredGreenRests = activeNotes.filter(n =>
+            n.note.isRest &&
+            n.status === 'match_perfect' &&
+            !scoredNoteIds.current.has(n.id)
+        );
+
+        if (unscoredGreenRests.length > 0) {
+            unscoredGreenRests.forEach(n => scoredNoteIds.current.add(n.id));
+
+            // Apply rewards
+            setScore(s => s + (unscoredGreenRests.length * SCORE_PERFECT));
+            setStats(s => ({ ...s, perfect: s.perfect + unscoredGreenRests.length }));
+            setCombo(c => c + unscoredGreenRests.length);
+            setFeedback({ text: 'GOOD REST! +5', color: 'text-green-500' });
+            setTimeout(() => setFeedback(null), 500);
+        }
+
+    }, [activeNotes, isPlaying]);
 
     // Interaction Handler
     const handleInteraction = useCallback(() => {
@@ -349,7 +391,8 @@ export default function RhythmPage() {
             if (target.note.isRest) {
                 if (timeDiff < GOOD_WINDOW_S) {
                     setCombo(0);
-                    setFeedback({ text: 'Don\'t Click Rests!', color: 'text-red-500' });
+                    setStats(s => ({ ...s, miss: s.miss + 1 }));
+                    setFeedback({ text: 'Non suonare durante le pause!', color: 'text-red-500' });
                     setTimeout(() => setFeedback(null), 500);
                     return currentNotes.map(n => n.id === target.id ? { ...n, status: 'miss' } : n);
                 }
@@ -362,11 +405,15 @@ export default function RhythmPage() {
             if (timeDiff <= PERFECT_WINDOW_S) {
                 newStatus = 'match_perfect';
                 points = SCORE_PERFECT;
-                setFeedback({ text: 'PERFECT! +5', color: 'text-green-500' });
+                setStats(s => ({ ...s, perfect: s.perfect + 1 }));
+                setFeedback({ text: 'PERFETTO! +5', color: 'text-green-500' });
+                scoredNoteIds.current.add(target.id);
             } else if (timeDiff <= GOOD_WINDOW_S) {
                 newStatus = 'match_good';
                 points = SCORE_GOOD;
-                setFeedback({ text: 'Good +3', color: 'text-yellow-500' });
+                setStats(s => ({ ...s, good: s.good + 1 }));
+                setFeedback({ text: 'Buono +3', color: 'text-yellow-500' });
+                scoredNoteIds.current.add(target.id);
             } else {
                 // Too early/late click?
                 // If very far, maybe ignore?
@@ -374,7 +421,8 @@ export default function RhythmPage() {
 
                 newStatus = 'miss';
                 setCombo(0);
-                setFeedback({ text: 'Miss!', color: 'text-red-500' });
+                setStats(s => ({ ...s, miss: s.miss + 1 }));
+                setFeedback({ text: 'Errore!', color: 'text-red-500' });
             }
 
             if (points > 0) {
@@ -398,135 +446,169 @@ export default function RhythmPage() {
                 onTouchStart={handleInteraction}
             >
                 <div className="text-center mb-8">
-                    <h1 className="text-4xl font-bold text-amber-700">🥁 Rhythm Mode</h1>
-                    <p className="text-amber-600">Master the groove</p>
+                    <h1 className="text-4xl font-bold text-amber-700">🥁 Solfeggio Ritmico</h1>
+                    <p className="text-amber-600 font-medium mt-2 max-w-xl mx-auto">
+                        Tocca lo schermo o clicca con il mouse <strong>a tempo</strong> con le note.
+                        Durante le <strong>pause</strong>, non fare nulla e aspetta che passino (diventeranno verdi!).
+                    </p>
                 </div>
 
-                {/* Visible STOP Button (When Playing) */}
-                {isPlaying && (
-                    <div className="fixed top-20 right-4 z-[60] animate-in fade-in slide-in-from-top-4 duration-300">
-                        <button
-                            onClick={stopGame}
-                            onMouseDown={(e) => e.stopPropagation()}
-                            onTouchStart={(e) => e.stopPropagation()}
-                            className="bg-red-600 hover:bg-red-700 text-white font-bold py-3 px-8 rounded-full shadow-2xl border-4 border-white transform transition hover:scale-105 flex items-center gap-2"
-                        >
-                            <span className="text-2xl">⏹️</span>
-                            <span>STOP</span>
-                        </button>
-                    </div>
-                )}
 
-                {/* Score Board */}
-                <div className="grid grid-cols-3 gap-4 mb-2 text-center max-w-3xl mx-auto">
-                    <div className="bg-white p-4 rounded-lg shadow border border-amber-100">
-                        <p className="text-gray-500 text-sm">SCORE</p>
-                        <p className="text-3xl font-bold text-amber-600">{score}</p>
-                    </div>
-                    <div className="bg-white p-4 rounded-lg shadow border border-amber-100">
-                        <p className="text-gray-500 text-sm">COMBO</p>
-                        <p className="text-3xl font-bold text-orange-500">{combo}x</p>
-                        {combo % 10 === 0 && combo > 0 && (
-                            <span className="block text-xs font-bold text-amber-500 animate-bounce mt-1">PERFECT!</span>
-                        )}
-                    </div>
-                    <div className="bg-white p-4 rounded-lg shadow border border-amber-100">
-                        <p className="text-gray-500 text-sm">BPM</p>
-                        <div className="flex items-center justify-center space-x-2">
+                {/* CONTROL PANEL (Above Staff) */}
+                <div className="bg-white p-4 rounded-xl shadow-md border border-amber-100 mb-6 relative z-20">
+
+                    {/* TOP ROW: Start/Stop + BPM + Visual Mode */}
+                    <div className="flex flex-wrap justify-between items-center gap-4 mb-4 border-b border-gray-100 pb-4">
+
+                        {/* Start/Stop Button */}
+                        <div>
+                            {!isPlaying ? (
+                                <button
+                                    onClick={startGame}
+                                    className="bg-amber-600 hover:bg-amber-700 text-white font-bold py-3 px-8 rounded-full shadow-lg transform transition hover:scale-105 flex items-center gap-2"
+                                >
+                                    <span className="text-xl">▶️</span>
+                                    <span>START</span>
+                                </button>
+                            ) : (
+                                <button
+                                    onClick={stopGame}
+                                    className="bg-red-600 hover:bg-red-700 text-white font-bold py-3 px-8 rounded-full shadow-lg transform transition hover:scale-105 flex items-center gap-2"
+                                >
+                                    <span className="text-xl">⏹️</span>
+                                    <span>STOP</span>
+                                </button>
+                            )}
+                        </div>
+
+                        {/* Visual Mode Toggle */}
+                        <div className="bg-stone-100 p-1 rounded-lg flex space-x-1">
+                            <button
+                                onClick={(e) => { e.stopPropagation(); setVisualMode('scrolling'); }}
+                                className={`px-4 py-2 rounded-md font-bold transition flex items-center gap-2 ${visualMode === 'scrolling' ? 'bg-white shadow text-amber-600' : 'text-gray-400 hover:text-gray-600'}`}
+                            >
+                                <span className="text-xl">🌊</span>
+                                <span>Scorrimento</span>
+                            </button>
+                            <button
+                                onClick={(e) => { e.stopPropagation(); setVisualMode('static'); }}
+                                className={`px-4 py-2 rounded-md font-bold transition flex items-center gap-2 ${visualMode === 'static' ? 'bg-white shadow text-amber-600' : 'text-gray-400 hover:text-gray-600'}`}
+                            >
+                                <span className="text-xl">📄</span>
+                                <span>Statico</span>
+                            </button>
+                        </div>
+
+                        {/* BPM Slider */}
+                        <div className="flex items-center space-x-3 bg-stone-50 px-4 py-2 rounded-lg border border-stone-200">
+                            <span className="text-xs font-bold text-gray-500 uppercase">BPM</span>
                             <input
                                 type="range"
                                 min="40"
                                 max="200"
                                 value={bpm}
                                 onChange={(e) => { e.stopPropagation(); setBpm(Number(e.target.value)); }}
-                                disabled={isPlaying}
-                                className="w-24 accent-amber-600"
+                                className="w-32 accent-amber-600"
                             />
-                            <span className="text-2xl font-bold text-stone-700">{bpm}</span>
+                            <span className="text-xl font-bold text-amber-700 min-w-[3ch]">{bpm}</span>
                         </div>
                     </div>
 
-                    {/* Note Durations Selection */}
-                    <div className="col-span-3 bg-white p-4 rounded-lg shadow border border-amber-100 mt-2">
-                        <span className="text-gray-500 text-sm font-bold block mb-2">NOTE VALUES:</span>
-                        <div className="flex flex-wrap justify-center gap-4">
-                            {[
-                                { id: 'w', label: 'Whole (4)' },
-                                { id: 'h', label: 'Half (2)' },
-                                { id: 'q', label: 'Quarter (1)' },
-                                { id: '8', label: 'Eighth (1/2)' },
-                                { id: '16', label: '16th (1/4)' }
-                            ].map(opt => (
-                                <label key={opt.id} className="flex items-center space-x-2 cursor-pointer bg-stone-50 px-3 py-1 rounded-full border border-stone-200 hover:bg-stone-100">
-                                    <input
-                                        type="checkbox"
-                                        checked={durationOptions[opt.id as keyof typeof durationOptions]}
-                                        disabled={isPlaying}
-                                        onChange={(e) => {
-                                            e.stopPropagation();
-                                            setDurationOptions(prev => ({
-                                                ...prev,
-                                                [opt.id]: e.target.checked
-                                            }));
-                                        }}
-                                        className="w-4 h-4 text-amber-600 rounded focus:ring-amber-500"
-                                    />
-                                    <span className={`text-sm font-medium ${durationOptions[opt.id as keyof typeof durationOptions] ? 'text-amber-800' : 'text-gray-400'}`}>
-                                        {opt.label}
-                                    </span>
-                                </label>
+                    {/* MIDDLE ROW: Durations + Time Sig */}
+                    <div className="flex flex-wrap items-center justify-between gap-4 mb-4">
+
+                        {/* Durations (Always Visible) */}
+                        <div className="flex items-center gap-2">
+                            <span className="text-xs font-bold text-gray-500 uppercase mr-2">Note:</span>
+                            <div className="flex flex-wrap gap-2">
+                                {[
+                                    { id: 'w', label: 'Semibreve' },
+                                    { id: 'h', label: 'Minima' },
+                                    { id: 'q', label: 'Semiminima' },
+                                    { id: '8', label: 'Croma' },
+                                    { id: '16', label: 'Semicroma' }
+                                ].map(opt => (
+                                    <label key={opt.id} className={`flex items-center space-x-1 cursor-pointer px-3 py-1.5 rounded-full border transition-all ${durationOptions[opt.id as keyof typeof durationOptions] ? 'bg-amber-50 border-amber-200 text-amber-800' : 'bg-white border-gray-200 text-gray-400 hover:border-gray-300'}`}>
+                                        <input
+                                            type="checkbox"
+                                            checked={durationOptions[opt.id as keyof typeof durationOptions]}
+                                            onChange={(e) => {
+                                                e.stopPropagation();
+                                                setDurationOptions(prev => ({ ...prev, [opt.id]: e.target.checked }));
+                                            }}
+                                            className="w-4 h-4 text-amber-600 rounded focus:ring-amber-500 accent-amber-600"
+                                        />
+                                        <span className="text-sm font-medium">{opt.label}</span>
+                                    </label>
+                                ))}
+                            </div>
+                        </div>
+
+                        {/* Time Signature */}
+                        <div className="flex items-center gap-2 bg-stone-50 px-3 py-1.5 rounded-lg border border-stone-200">
+                            <span className="text-xs font-bold text-gray-500 uppercase">Tempo:</span>
+                            {(['3/4', '4/4', '6/8'] as const).map(sig => (
+                                <button
+                                    key={sig}
+                                    onClick={(e) => { e.stopPropagation(); setTimeSignature(sig); }}
+                                    className={`px-2 py-0.5 rounded text-sm font-bold transition ${timeSignature === sig
+                                        ? 'bg-amber-600 text-white shadow-sm'
+                                        : 'text-gray-400 hover:text-gray-600'
+                                        }`}
+                                >
+                                    {sig}
+                                </button>
                             ))}
                         </div>
                     </div>
 
-                    <div className="col-span-3 bg-white p-4 rounded-lg shadow border border-amber-100 mt-2 flex justify-center items-center space-x-4">
-                        <span className="text-gray-500 text-sm font-bold">TIME SIG:</span>
-                        {(['3/4', '4/4', '6/8'] as const).map(sig => (
-                            <button
-                                key={sig}
-                                onClick={(e) => { e.stopPropagation(); setTimeSignature(sig); }}
-                                className={`px-3 py-1 rounded-full text-sm font-bold transition ${timeSignature === sig
-                                    ? 'bg-amber-600 text-white shadow-md'
-                                    : 'bg-gray-100 text-gray-500 hover:bg-gray-200'
-                                    }`}
-                            >
-                                {sig}
-                            </button>
-                        ))}
-                    </div>
-                </div>
+                    {/* BOTTOM ROW: Settings (Rests, Metronome, Sounds) */}
+                    <div className="flex flex-wrap items-center justify-center sm:justify-start gap-6 pt-2 border-t border-gray-50">
+                        <label className="flex items-center space-x-2 cursor-pointer group">
+                            <input type="checkbox" checked={includeRests} onChange={e => setIncludeRests(e.target.checked)} className="w-5 h-5 text-amber-600 rounded focus:ring-amber-500" />
+                            <span className="text-gray-700 font-medium group-hover:text-amber-700 transition">Aggiungi Pause</span>
+                        </label>
 
-                {/* Visual Mode Toggle */}
-                <div className="flex justify-center mb-1">
-                    <div className="bg-stone-100 p-0.5 rounded-lg flex space-x-1">
-                        <button
-                            onClick={(e) => { e.stopPropagation(); setVisualMode('scrolling'); }}
-                            className={`px-3 py-1 rounded-md text-sm font-bold transition ${visualMode === 'scrolling' ? 'bg-white shadow text-amber-600' : 'text-gray-400'}`}
-                        >
-                            🌊 Scrolling
-                        </button>
-                        <button
-                            onClick={(e) => { e.stopPropagation(); setVisualMode('static'); }}
-                            className={`px-3 py-1 rounded-md text-sm font-bold transition ${visualMode === 'static' ? 'bg-white shadow text-amber-600' : 'text-gray-400'}`}
-                        >
-                            📄 Static
-                        </button>
+                        <label className="flex items-center space-x-2 cursor-pointer group">
+                            <input type="checkbox" checked={isMetronomeEnabled} onChange={e => setIsMetronomeEnabled(e.target.checked)} className="w-5 h-5 text-amber-600 rounded focus:ring-amber-500" />
+                            <span className="text-gray-700 font-medium group-hover:text-amber-700 transition">Metronomo</span>
+                        </label>
+
+                        <label className="flex items-center space-x-2 cursor-pointer group">
+                            <input type="checkbox" checked={isSoundEnabled} onChange={e => setIsSoundEnabled(e.target.checked)} className="w-5 h-5 text-amber-600 rounded focus:ring-amber-500" />
+                            <span className="text-gray-700 font-medium group-hover:text-amber-700 transition">Suoni</span>
+                        </label>
                     </div>
+
                 </div>
 
                 {/* Game Area */}
-                <div className="relative max-w-5xl mx-auto h-[400px] flex items-center justify-center">
+                <div
+                    ref={containerRef}
+                    className="relative max-w-5xl mx-auto h-[400px] flex items-center justify-center border-t border-gray-100 mt-8 pt-4"
+                >
 
                     {/* UI OVERLAYS (Positioned ABOVE staff) */}
 
+                    {/* Internal Stats Overlay */}
+                    <div className="absolute top-2 left-0 right-0 flex justify-center space-x-4 pointer-events-none z-30">
+                        <ScoreStats perfect={stats.perfect} good={stats.good} miss={stats.miss} />
+                        {combo > 1 && (
+                            <div className="bg-white/90 px-4 py-2 rounded-lg border border-orange-200 shadow-sm">
+                                <span className="text-orange-500 font-bold block text-sm">COMBO</span>
+                                <span className="text-2xl font-bold text-orange-600">{combo}x</span>
+                            </div>
+                        )}
+                    </div>
+
                     {/* Countdown Overlay - Moved TOP */}
                     {countdown !== null && (
-                        <div className="absolute -top-32 left-0 right-0 flex items-center justify-center z-40 pointer-events-none transition-opacity duration-300">
-                            <div key={countdown} className="text-center animate-in zoom-in duration-75 bg-white/90 px-8 py-4 rounded-2xl shadow-xl border border-amber-100">
-                                <div className="text-4xl font-black text-amber-600 mb-1">
+                        <div className="absolute top-24 left-0 right-0 flex items-center justify-center z-40 pointer-events-none transition-opacity duration-300">
+                            <div key={countdown} className="text-center animate-in zoom-in duration-75 bg-white/90 px-6 py-2 rounded-xl shadow-lg border border-amber-100">
+                                <div className="text-xl font-black text-amber-600 mb-0.5">
                                     {countdown > 1 ? 'WAIT' : 'READY...'}
                                 </div>
-                                <div className="text-7xl font-black text-amber-800">
+                                <div className="text-4xl font-black text-amber-800">
                                     {countdown}
                                 </div>
                             </div>
@@ -535,8 +617,8 @@ export default function RhythmPage() {
 
                     {/* Feedback - Moved TOP */}
                     {feedback && (
-                        <div className="absolute -top-16 left-0 right-0 z-50 flex justify-center pointer-events-none">
-                            <div className={`text-4xl font-black animate-bounce ${feedback.color} bg-white/90 px-6 py-2 rounded-full shadow-lg`}>
+                        <div className="absolute top-36 left-0 right-0 z-50 flex justify-center pointer-events-none">
+                            <div className={`text-2xl font-black animate-bounce ${feedback.color} bg-white/90 px-6 py-2 rounded-full shadow-lg`}>
                                 {feedback.text}
                             </div>
                         </div>
@@ -555,51 +637,8 @@ export default function RhythmPage() {
                     )}
 
                 </div>
-            </main>
-            {/* Start Screen Controls (Only visible when NOT playing) */}
-            {!isPlaying && (
-                <div className="flex justify-center flex-col items-center space-y-4 pb-12">
-                    <div className="text-center space-y-4">
-                        <div className="flex space-x-6 justify-center bg-white p-4 rounded-lg shadow-sm">
-                            <label className="flex items-center space-x-2 cursor-pointer">
-                                <input
-                                    type="checkbox"
-                                    checked={includeRests}
-                                    onChange={e => setIncludeRests(e.target.checked)}
-                                    className="w-5 h-5 text-amber-600"
-                                />
-                                <span className="text-gray-700">Include Rests</span>
-                            </label>
-
-                            <label className="flex items-center space-x-2 cursor-pointer">
-                                <input
-                                    type="checkbox"
-                                    checked={isMetronomeEnabled}
-                                    onChange={e => setIsMetronomeEnabled(e.target.checked)}
-                                    className="w-5 h-5 text-amber-600"
-                                />
-                                <span className="text-gray-700">Metronome</span>
-                            </label>
-
-                            <label className="flex items-center space-x-2 cursor-pointer">
-                                <input
-                                    type="checkbox"
-                                    checked={isSoundEnabled}
-                                    onChange={e => setIsSoundEnabled(e.target.checked)}
-                                    className="w-5 h-5 text-amber-600"
-                                />
-                                <span className="text-gray-700">Sounds</span>
-                            </label>
-                        </div>
-                        <button
-                            onClick={startGame}
-                            className="bg-amber-600 hover:bg-amber-700 text-white font-bold py-4 px-12 rounded-full shadow-lg transform transition hover:scale-105"
-                        >
-                            START RHYTHM
-                        </button>
-                    </div>
-                </div>
-            )}
-        </div>
+            </main >
+        </div >
     );
 };
+

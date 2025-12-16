@@ -16,22 +16,62 @@ export default function Header() {
     useEffect(() => {
         setMounted(true);
 
-        // Check MIDI support
-        if (typeof navigator !== 'undefined' && typeof navigator.requestMIDIAccess === 'function') {
-            setMidiStatus({ hasAccess: true, error: null });
-        } else {
-            setMidiStatus({
-                hasAccess: false,
-                error: 'WebMIDI not supported'
-            });
-        }
+        // Check availability on mount but DO NOT auto-set to true.
+        // We only set to true if we actually have active inputs or permission is already 'granted' with inputs.
+        const checkConnection = async () => {
+            // Auto-detect and connect if permission is already granted
+            if (typeof navigator !== 'undefined' && typeof navigator.requestMIDIAccess === 'function') {
+                try {
+                    // Check permissions API first
+                    // @ts-ignore - permissions API for MIDI
+                    const permission = await navigator.permissions.query({ name: 'midi' });
+
+                    if (permission.state === 'granted') {
+                        // Safe to call without prompt
+                        handleMIDIConnect();
+                    } else {
+                        // User hasn't granted yet, start OFF
+                        setMidiStatus(prev => ({ ...prev, hasAccess: false, error: null }));
+                    }
+                } catch (e) {
+                    // Permission API failed or not supported, strictly wait for user interaction to avoid prompts
+                    // But verify if we can just try requestMIDIAccess logic? No, keep it safe.
+                    setMidiStatus(prev => ({ ...prev, hasAccess: false, error: null }));
+                }
+            } else {
+                setMidiStatus({
+                    hasAccess: false,
+                    error: 'WebMIDI not supported'
+                });
+            }
+        };
+
+        checkConnection();
     }, []);
 
     const handleMIDIConnect = async () => {
         try {
             if (typeof navigator !== 'undefined' && typeof navigator.requestMIDIAccess === 'function') {
-                await navigator.requestMIDIAccess();
-                setMidiStatus({ hasAccess: true, error: null });
+                const access = await navigator.requestMIDIAccess();
+
+                // Strict check: Are there inputs?
+                if (access.inputs.size > 0) {
+                    setMidiStatus({ hasAccess: true, error: null });
+                } else {
+                    // Start listener for hot-plug
+                    setMidiStatus({ hasAccess: false, error: 'No MIDI inputs found' });
+                }
+
+                // Listen for state changes
+                access.onstatechange = (e: any) => {
+                    // Re-check count
+                    if (access.inputs.size > 0) {
+                        setMidiStatus({ hasAccess: true, error: null });
+                    } else {
+                        setMidiStatus({ hasAccess: false, error: 'Device disconnected' });
+                    }
+                };
+
             }
         } catch (error) {
             setMidiStatus({
@@ -55,17 +95,17 @@ export default function Header() {
 
                     {/* Desktop Navigation */}
                     <nav className="hidden md:flex space-x-2">
-                        <Link href="/" className="px-3 py-2 text-gray-700 hover:bg-gray-100 rounded-md font-medium text-sm lg:text-base">
-                            Sight Reading
+                        <Link href="/sight-reading" className="px-3 py-2 text-gray-700 hover:bg-gray-100 rounded-md font-medium text-sm lg:text-base">
+                            Lettura Musicale
                         </Link>
                         <Link href="/challenge" className="px-3 py-2 text-blue-600 bg-blue-50 hover:bg-blue-100 rounded-md font-medium text-sm lg:text-base">
                             Challenge
                         </Link>
-                        <Link href="/rhythm" className="px-3 py-2 text-amber-600 bg-amber-50 hover:bg-amber-100 rounded-md font-medium text-sm lg:text-base">
-                            Rhythm
+                        <Link href="/" className="px-3 py-2 text-amber-600 bg-amber-50 hover:bg-amber-100 rounded-md font-medium text-sm lg:text-base">
+                            Solfeggio Ritmico
                         </Link>
                         <Link href="/melodic-solfege" className="px-3 py-2 text-purple-600 bg-purple-50 hover:bg-purple-100 rounded-md font-medium text-sm lg:text-base">
-                            Solfege
+                            Solfeggio Melodico
                         </Link>
                     </nav>
 
@@ -73,18 +113,16 @@ export default function Header() {
                         {/* Only render after mounting (prevents hydration error) */}
                         {mounted && (
                             <div className="hidden sm:flex items-center space-x-2">
-                                {!midiStatus.hasAccess ? (
-                                    <button
-                                        onClick={handleMIDIConnect}
-                                        className="px-3 py-1.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-semibold"
-                                    >
-                                        Connect MIDI
-                                    </button>
-                                ) : (
-                                    <div className="px-3 py-1.5 bg-green-50 border border-green-200 rounded-lg">
-                                        <span className="text-green-700 text-sm font-medium">✓ MIDI Ready</span>
-                                    </div>
-                                )}
+                                <button
+                                    onClick={handleMIDIConnect}
+                                    className={`text-sm font-bold px-2 py-1 rounded transition-colors ${midiStatus.hasAccess
+                                        ? 'text-green-600 bg-green-50 hover:bg-green-100'
+                                        : 'text-red-600 bg-red-50 hover:bg-red-100'
+                                        }`}
+                                    title={midiStatus.hasAccess ? "MIDI Connected" : "Click to Connect MIDI"}
+                                >
+                                    {midiStatus.hasAccess ? '● MIDI ON' : '○ MIDI OFF'}
+                                </button>
                             </div>
                         )}
 
@@ -127,11 +165,11 @@ export default function Header() {
                     <div className="md:hidden mt-4 pb-2 border-t border-gray-100 pt-4 space-y-2">
                         <div className="flex flex-col space-y-2">
                             <Link
-                                href="/"
+                                href="/sight-reading"
                                 onClick={() => setIsMobileMenuOpen(false)}
                                 className="px-4 py-3 bg-gray-50 text-gray-800 rounded-lg font-medium hover:bg-gray-100"
                             >
-                                👁️ Sight Reading
+                                👁️ Lettura Musicale
                             </Link>
                             <Link
                                 href="/challenge"
@@ -141,18 +179,18 @@ export default function Header() {
                                 ⚡ Challenge Mode
                             </Link>
                             <Link
-                                href="/rhythm"
+                                href="/"
                                 onClick={() => setIsMobileMenuOpen(false)}
                                 className="px-4 py-3 bg-amber-50 text-amber-700 rounded-lg font-medium hover:bg-amber-100"
                             >
-                                🥁 Rhythm Mode
+                                🥁 Solfeggio Ritmico
                             </Link>
                             <Link
                                 href="/melodic-solfege"
                                 onClick={() => setIsMobileMenuOpen(false)}
                                 className="px-4 py-3 bg-purple-50 text-purple-700 rounded-lg font-medium hover:bg-purple-100"
                             >
-                                🎵 Melodic Solfege
+                                🎵 Solfeggio Melodico
                             </Link>
 
                             <button

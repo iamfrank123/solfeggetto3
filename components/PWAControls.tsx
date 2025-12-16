@@ -59,12 +59,12 @@ export default function PWAControls() {
     if (!showInstall && !showUpdate) return null
 
     return (
-        <div className="fixed bottom-6 right-6 z-[100] flex flex-col gap-4 items-end pointer-events-none">
+        <div className="fixed z-[100] flex flex-col gap-4 pointer-events-none w-full bottom-0 left-0 p-4 items-center md:w-auto md:bottom-6 md:right-6 md:items-end">
             {/* Container is pointer-events-none so it doesn't block clicks elsewhere, 
           but children have pointer-events-auto */}
 
             {showInstall && (
-                <div className="bg-white/90 backdrop-blur-md p-4 rounded-xl shadow-2xl border border-purple-200 pointer-events-auto max-w-sm animate-bounce">
+                <div className="bg-white/95 backdrop-blur-md p-6 md:p-4 rounded-xl shadow-2xl border border-purple-200 pointer-events-auto w-full max-w-sm animate-in slide-in-from-bottom duration-500">
                     <h3 className="font-bold text-gray-900 mb-1">Installa App</h3>
                     <p className="text-sm text-gray-600 mb-3">Scarica l'app per un'esperienza a schermo intero e offline!</p>
                     <div className="flex gap-2">
